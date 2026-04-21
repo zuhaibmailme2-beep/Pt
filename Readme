@@ -1,3 +1,32 @@
-Got it — authorized pentest/internal program/own-company context, intranet-only with no internet egress, and a mixed/unknown stack. The no-egress constraint is the most important variable: it rules out passive recon APIs, cloud OAST, and anything that phones home. I'll build the methodology around that. Diving in now.
+cat > internal_resolvers.txt <<EOF
+10.10.1.10
+10.10.1.11
+EOF
 
-Your internal web application pentest methodology report is ready. It covers air-gapped toolbox preparation, self-hosted OAST setup, and Active Directory-integrated recon workflows tailored for intranet-only targets with no internet egress. The report spans nine phases—from initial reconnaissance with nmap/masscan/NetExec through content discovery, vulnerability scanning with offline Nuclei, manual exploitation via Burp with NTLM/Kerberos, authentication-specific testing including NTLM relay and Kerberoasting, secrets hunting across internal Git and SMB shares, and local-first reporting—plus a Day-1 quick-start command reference and cross-cutting hygiene checklist. Key tooling includes Impacket, ntlmrelayx, Kerbrute, puredns, katana, jsluice, kiterunner, ffuf, custom Nuclei templates, and self-hosted interactsh, with detailed offline-mode configurations throughout.
+# dnsx — resolve + PTR sweep a whole /16 to paint a hostname map
+dnsx -l subdomains.txt -r internal_resolvers.txt -a -aaaa -cname -ns -mx -txt -resp -o dnsx_recs.txt
+echo 10.10.0.0/16 | dnsx -ptr -resp -r internal_resolvers.txt -silent -o ptr_10.10.txt
+
+# puredns — subdomain brute against internal resolver (CRITICAL: --skip-validation + trusted=internal)
+puredns bruteforce /opt/wordlists/SecLists/Discovery/DNS/subdomains-top1million-110000.txt \
+        corp.local \
+        --resolvers internal_resolvers.txt \
+        --resolvers-trusted internal_resolvers.txt \
+        --skip-validation --rate-limit 500 \
+        --write corp_local_subs.txt --write-wildcards corp_local_wildcards.txt
+
+# dig — AXFR attempts + SRV for DCs/Exchange/KMS/WPAD
+for zone in corp.local corp.internal dev.corp.local; do
+  for ns in $(dig @10.10.1.10 +short NS $zone); do
+    dig @$ns $zone AXFR +nocomments +nostats
+  done
+done | tee axfr.txt
+
+for srv in _kerberos._tcp _ldap._tcp _ldap._tcp.dc._msdcs _gc._tcp \
+           _autodiscover._tcp _http._tcp _vlmcs._tcp _wpad._tcp; do
+  dig @10.10.1.10 +short SRV ${srv}.corp.local
+done
+
+# dnsrecon — reverse CIDR + cache snoop
+dnsrecon -r 10.10.0.0/16 -n 10.10.1.10 -t rvl -j rvl.json
+dnsrecon -t snoop -n 10.10.1.10 -D cache_snoop_wordlist.txt
